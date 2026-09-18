@@ -1,0 +1,41 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# Storage & Local Databases (Never commit local vector stores)
+.storage/
+*.db
+*.sqlite3
+
+# Environment Variables & Secrets (Never commit secrets)
+.env
+.env.local
+
+# Testing & Linting
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Evaluation outputs (generated at runtime)
+eval/results/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
