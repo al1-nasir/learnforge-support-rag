@@ -449,3 +449,4 @@ If transitioning this prototype to enterprise scale:
 5. **Observability & Guardrails**:
    - Integrate OpenTelemetry for distributed tracing.
    - Deploy automated evaluation monitors in production to flag drifting hallucination rates or sudden spikes in human escalations.
+
