@@ -102,6 +102,28 @@ class Settings(BaseSettings):
         description="Logging level for standard output logging.",
     )
 
+    # Observability Settings (Langfuse optional tracing)
+    langfuse_enabled: bool = Field(
+        default=False,
+        description="Whether Langfuse observability tracing is enabled.",
+    )
+    langfuse_public_key: str = Field(
+        default="",
+        description="Langfuse project public key.",
+    )
+    langfuse_secret_key: str = Field(
+        default="",
+        description="Langfuse project secret key.",
+    )
+    langfuse_base_url: str = Field(
+        default="https://cloud.langfuse.com",
+        description="Langfuse API host/base URL.",
+    )
+    langfuse_tracing_environment: str = Field(
+        default="demo",
+        description="Langfuse tracing environment identifier.",
+    )
+
 
 @lru_cache
 def get_settings() -> Settings:

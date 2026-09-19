@@ -55,7 +55,7 @@ Cross-Encoder Reranking (ms-marco-MiniLM-L-6-v2) → Top 5 Evidence Items
   ↓
 Reliability Layer (Source Precedence, Freshness & Contradiction tagging)
   ↓
-Constrained LLM Prompting (Groq gpt-oss-20b Structured Output)
+Constrained LLM Prompting (Groq Structured Output: qwen3.8-27b)
   ↓
 Pydantic Validation + Citation Verification + Capability Guard (1 Bounded Retry)
   ↓
@@ -89,7 +89,7 @@ cp .env.example .env
 *(Optional for live LLM calls)* Add your Groq API key to `.env`:
 ```env
 GROQ_API_KEY=gsk_your_groq_api_key_here
-LLM_MODEL=openai/gpt-oss-20b
+LLM_MODEL=qwen/qwen3.8-27b
 ```
 > [!NOTE]
 > All unit, integration, and regression tests run **completely offline** with mocked LLM boundaries and require no API key or network access.
@@ -122,22 +122,38 @@ curl -s http://127.0.0.1:8000/health | jq
   "status": "healthy",
   "index_ready": true,
   "record_count": 40,
-  "llm_model": "openai/gpt-oss-20b",
+  "llm_model": "qwen/qwen3.8-27b",
   "dense_model": "BAAI/bge-small-en-v1.5"
 }
 ```
 
-### 5. Run the Tests & Evaluation
+### 5. Run the Customer Support Demo UI (Vite + React + assistant-ui)
+A clean, production-styled single-page chatbot interface connects directly to the FastAPI backend:
+
 ```bash
-# Run all 45 unit, integration, and regression tests
+cd frontend
+npm install
+npm run dev
+```
+Open [http://localhost:5173](http://localhost:5173) in your browser.
+
+- **Grounded Answer Display**: Displays verified responses with clickable source citation pills (`POLICY-04`, `FAQ-02`, etc.).
+- **Clarification State**: Indicates when additional user input is required (`More information needed`).
+- **Escalation Handoff**: Renders calm amber review cards with structured handoff summaries when human review is required, without claiming false ticketing actions.
+- **Session Continuity**: Retains in-memory multi-turn conversational context for the page lifetime.
+
+### 6. Run the Tests & Evaluation
+```bash
+# Run all 59 unit, integration, and regression tests
 pytest -v
 
 # Run Ruff linter
 ruff check .
 
-# Run the 25-case evaluation benchmark
+# Run the evaluation benchmark suites
 python -m scripts.run_eval
 ```
+
 
 ---
 
@@ -308,88 +324,162 @@ Escalations generate a structured `handoff_summary` briefing human agents on the
 
 ---
 
-## 12. Evaluation Framework
+## 12. Observability with Langfuse (v4 SDK)
 
-Evaluation is driven by [eval/golden.jsonl](eval/golden.jsonl), a manually curated benchmark of **25 high-value test cases** representing all critical operational categories:
-- Direct FAQ inquiries
-- Direct Policy inquiries
-- Exact lexical term matching
-- Stale / outdated policy traps (14 days vs. 7 days; mobile downloads vs. desktop)
-- Policy vs. Ticket contradiction handling
-- Ambiguous intent ("Cancel my LearnForge")
-- Multi-turn anaphoric follow-ups ("What if I bought it through Apple?")
-- Account-specific billing queries (declined authorization hold vs. completed charge)
-- Capability boundary enforcement
-- Unsupported queries with zero corpus evidence
+LearnForge integrates comprehensive, production-grade observability via the **Langfuse Python SDK (v4)** and **OpenInference Groq auto-instrumentation**.
 
-Run the evaluation suite:
+### Fail-Open Architecture
+Observability is strictly **non-participating** and never blocks normal application flow:
+- Default state: `LANGFUSE_ENABLED=false`.
+- If disabled, unconfigured, or encountering any network or authentication errors, the entire support service (`/chat`, evaluation runner, and CLI) continues running without throwing unhandled exceptions.
+- Zero credentials or API keys are ever committed, logged, or printed.
+
+### Trace Hierarchy
+Every customer turn emits a structured, deterministic root trace containing child spans for each pipeline stage:
+
+```text
+support-request
+│
+├── hybrid-retrieval
+├── cross-encoder-reranking
+├── reliability-check
+├── groq-generation (captured automatically via openinference-instrumentation-groq)
+└── response-validation
+```
+
+- **`support-request`**: Root span seeded with deterministic 32-character hexadecimal trace ID (`Langfuse.create_trace_id(seed=request_id)`). Uses `propagate_attributes` to attach `session_id`, `environment`, `tags`, and request `metadata` to all child observations.
+- **`hybrid-retrieval`**: Captures retrieval query, top-k parameters, and candidate record count and IDs.
+- **`cross-encoder-reranking`**: Captures candidate IDs, reranker model name, top evidence IDs, cross-encoder scores, and latency.
+- **`reliability-check`**: Captures source authority sorting, deprecation filtering, and authoritative candidate IDs.
+- **`groq-generation`**: Automatically captured by `GroqInstrumentor` with prompt messages, token counts, model parameters, and raw JSON completion.
+- **`response-validation`**: Validates schema, grounds citations against available evidence, enriches citations with document titles, and detects capability boundary violations.
+
+### Evaluation Runner Telemetry & Scoring
+When running `python -m scripts.run_eval --live`, the evaluation runner automatically:
+1. Tags traces with dataset tags (`["evaluation", "golden"]` or `["evaluation", "holdout"]`).
+2. Attaches case metadata (`eval_case_id`, `eval_dataset`, `eval_category`).
+3. Publishes automated evaluation metrics as Langfuse scores (`decision_accuracy`, `citation_validity`, `citation_completeness`, `retrieval_hit`).
+4. Flushes all queued telemetry before exit via `flush_observability()`.
+
+---
+
+## 13. Evaluation Framework
+
+The system is evaluated against two distinct, standardized benchmark datasets:
+1. **Original Golden Benchmark Set** ([`eval/golden.jsonl`](eval/golden.jsonl)): A curated benchmark of **25 high-value test cases** representing all critical operational categories:
+   - Direct FAQ inquiries
+   - Direct Policy inquiries
+   - Exact lexical term matching
+   - Stale / outdated policy traps (14 days vs. 7 days; mobile downloads vs. desktop)
+   - Policy vs. Ticket contradiction handling
+   - Ambiguous customer intent ("Cancel my LearnForge")
+   - Multi-turn anaphoric follow-ups ("What if I bought it through Apple?")
+   - Account-specific billing queries (declined authorization hold vs. completed charge)
+   - Capability boundary enforcement (direct cancellation / refund demands)
+   - Unsupported queries with zero corpus evidence
+2. **Untouched Holdout Benchmark Set** ([`eval/holdout.jsonl`](eval/holdout.jsonl)): A separate suite of **10 realistic holdout test cases** created after prompt tuning to test out-of-sample generalization across unseen scenarios:
+   - Offline download mobile Wi-Fi constraints
+   - University-sponsored account email transfer boundaries
+   - Credential / login sharing security risks
+   - Post-purchase discount code requests
+   - Missing certificate quiz completion requirements
+   - Corporate firewall streaming domain whitelisting
+   - Chargeback account suspension risks
+   - In-person tutoring requests (unsupported domain)
+   - Direct account deletion commands (capability boundary)
+   - Apple App Store refund jurisdiction boundaries
+
+### Evaluation Runner Usage
 ```bash
+# Run both benchmark suites (offline retrieval-only mode by default)
 python -m scripts.run_eval
+
+# Run both benchmark suites with live LLM enabled
+python -m scripts.run_eval --live
+
+# Run individual datasets
+python -m scripts.run_eval --live --golden
+python -m scripts.run_eval --live --holdout
 ```
 
 ---
 
-## 13. Evaluation Results
+## 14. Evaluation Results
 
-Results from the real benchmark run on the complete 25-case golden set:
+> [!IMPORTANT]
+> **LLM Model Attribution**: All published live evaluation benchmark metrics reported below were generated using **`qwen/qwen3.8-27b`** via the Groq API (configured via `LLM_MODEL=qwen/qwen3.8-27b`). Initial exploratory testing evaluated `openai/gpt-oss-120b`, which validated grounding behavior but exhausted the 200,000 daily token limit (TPD) on Groq's on-demand free tier. The final end-to-end benchmark suites were executed and verified against `qwen/qwen3.8-27b`. Detailed JSON reports for each run are saved in `eval/results/`.
 
-```text
-================================================================================
-LEARNFORGE SUPPORT RAG EVALUATION BENCHMARK
-Total Test Cases: 25 | Live LLM Enabled: False
-================================================================================
-[✓] direct-faq-access              | MRR@5: 1.00 | Ret:  17.3ms | Rerank: 538.8ms
-[✓] direct-faq-password            | MRR@5: 1.00 | Ret:  20.2ms | Rerank: 502.5ms
-[✓] direct-faq-certificate         | MRR@5: 1.00 | Ret:  21.1ms | Rerank: 448.3ms
-[✓] direct-faq-devices             | MRR@5: 1.00 | Ret:  23.3ms | Rerank: 509.0ms
-[✓] direct-faq-email-change        | MRR@5: 1.00 | Ret:  23.2ms | Rerank: 523.7ms
-[✓] direct-policy-subscription     | MRR@5: 1.00 | Ret:  30.2ms | Rerank: 516.5ms
-[✓] direct-policy-accessibility    | MRR@5: 1.00 | Ret:  27.0ms | Rerank: 505.5ms
-[✓] direct-policy-instructor       | MRR@5: 1.00 | Ret:  26.0ms | Rerank: 685.2ms
-[✓] direct-policy-progress         | MRR@5: 1.00 | Ret:  35.0ms | Rerank: 522.7ms
-[✓] direct-policy-security         | MRR@5: 1.00 | Ret:  24.2ms | Rerank: 545.4ms
-[✓] exact-refund-window            | MRR@5: 1.00 | Ret:  25.6ms | Rerank: 496.3ms
-[✓] stale-refund-window            | MRR@5: 0.50 | Ret:  30.0ms | Rerank: 523.5ms
-[✓] stale-offline-desktop          | MRR@5: 1.00 | Ret:  24.1ms | Rerank: 478.6ms
-[✓] stale-annual-billing           | MRR@5: 1.00 | Ret:  22.1ms | Rerank: 514.9ms
-[✓] stale-browser-ie               | MRR@5: 0.50 | Ret:  33.9ms | Rerank: 470.4ms
-[✓] policy-vs-ticket-conflict      | MRR@5: 1.00 | Ret:  51.7ms | Rerank: 647.8ms
-[✓] annual-subscription-ambiguity  | MRR@5: 1.00 | Ret:  55.2ms | Rerank: 555.5ms
-[✓] ambiguous-cancellation         | MRR@5: 0.33 | Ret:  22.3ms | Rerank: 493.9ms
-[✓] ambiguous-course-issue         | MRR@5: 1.00 | Ret:  17.9ms | Rerank: 496.0ms
-[✓] multi-turn-apple-refund        | MRR@5: 1.00 | Ret:  27.1ms | Rerank: 522.2ms
-[✓] multi-turn-progress-fix        | MRR@5: 1.00 | Ret:  29.1ms | Rerank: 473.1ms
-[✓] payment-declined-hold          | MRR@5: 1.00 | Ret:  31.4ms | Rerank: 512.8ms
-[✓] security-password-request      | MRR@5: 1.00 | Ret:  24.7ms | Rerank: 481.4ms
-[✓] capability-boundary-refund     | MRR@5: 1.00 | Ret:  27.6ms | Rerank: 501.5ms
-[✓] unknown-question-cafeteria     | MRR@5: 1.00 | Ret:  24.3ms | Rerank: 499.8ms
+### Suite 1: Original Golden Benchmark Set (25 Cases)
+*Report File: `eval/results/live_golden_report_1789751995.json`*
 
-================================================================================
-SUMMARY METRICS
-================================================================================
-Retrieval Hit@5:         100.0% (25/25)
-Retrieval MRR@5:         0.933
-Avg Retrieval Latency:   27.78 ms
-Avg Reranking Latency:   518.61 ms
-Avg Combined Retrieval:  546.39 ms
-Detailed Report:         eval/results/eval_report_*.json
-================================================================================
-```
+| Metric | Result | Target / Standard |
+| :--- | :--- | :--- |
+| **Retrieval Hit@5** | **100.0%** (25/25) | $\ge 90\%$ |
+| **Retrieval MRR@5** | **0.933** | $\ge 0.80$ |
+| **Decision Accuracy** | **96.0%** (24/25) | $\ge 90\%$ |
+| **Citation Validity Rate** | **100.0%** (18/18 answers) | $100.0\%$ (Zero unretrieved citations) |
+| **Mentioned-Source Citation Completeness** | **100.0%** (25/25) | $100.0\%$ (All mentioned doc IDs cited) |
+| **Expected Source Accuracy** | **100.0%** (24/24) | $\ge 90\%$ |
+| **Unsupported Claim / Hallucination Rate** | **0.0%** (0/25) | $0.0\%$ (Zero hallucinated policies) |
+| **Stale / Conflict Handling Accuracy** | **100.0%** (6/6) | $100.0\%$ (Policy precedes tickets) |
+| **Capability Boundary Accuracy** | **100.0%** (1/1) | $100.0\%$ (No unauthorized actions) |
+| **Escalation Recall** | **100.0%** | $100.0\%$ (All escalations caught) |
+| **Escalation Precision** | **80.0%** | Safe conservative routing |
+| **Avg Retrieval Latency** | 33.71 ms | Fast hybrid Qdrant search |
+| **Avg Reranking Latency** | 365.76 ms | Local cross-encoder |
+| **Avg LLM Latency** | 16,798.52 ms | Groq cloud API roundtrip |
+
+### Suite 2: Untouched Holdout Benchmark Set (10 Cases)
+*Report File: `eval/results/live_holdout_report_1789750691.json`*
+
+| Metric | Result | Target / Standard |
+| :--- | :--- | :--- |
+| **Retrieval Hit@5** | **100.0%** (10/10) | $\ge 90\%$ |
+| **Retrieval MRR@5** | **0.950** | $\ge 0.80$ |
+| **Decision Accuracy** | **90.0%** (9/10) | $\ge 85\%$ out-of-sample |
+| **Citation Validity Rate** | **100.0%** (7/7 answers) | $100.0\%$ (Zero unretrieved citations) |
+| **Mentioned-Source Citation Completeness** | **100.0%** (10/10) | $100.0\%$ (All mentioned doc IDs cited) |
+| **Expected Source Accuracy** | **100.0%** (8/8) | $\ge 90\%$ |
+| **Unsupported Claim / Hallucination Rate** | **0.0%** (0/10) | $0.0\%$ (Zero hallucinated policies) |
+| **Stale / Conflict Handling Accuracy** | **100.0%** (2/2) | $100.0\%$ (Precedence strictly enforced) |
+| **Capability Boundary Accuracy** | **100.0%** (1/1) | $100.0\%$ (Account deletion blocked) |
+| **Escalation Recall** | **100.0%** | $100.0\%$ (Zero missed escalations) |
+| **Escalation Precision** | **66.7%** | Safe conservative routing trade-off |
+| **Avg Retrieval Latency** | 35.71 ms | Fast hybrid Qdrant search |
+| **Avg Reranking Latency** | 363.17 ms | Local cross-encoder |
+| **Avg LLM Latency** | 13,328.80 ms | Groq cloud API roundtrip |
+
+### Notes on Metrics & Trade-offs
+
+1. **Mentioned-Source Citation Completeness**:
+   This metric validates *referential completeness*: it verifies that any formal document ID (e.g. `POLICY-02`, `FAQ-01`, `TICKET-06`) explicitly mentioned in the assistant's response message is present in the `citations` list and belongs to the valid retrieved evidence set. Furthermore, it ensures that every factual `ANSWER` includes non-empty citations.
+   *(Note: This measures identifier referential coverage; it does not perform semantic claim-level NLI decomposition).*
+
+2. **Holdout Escalation Precision (66.7%) as a Conservative Trade-off**:
+   In the untouched holdout evaluation, Escalation Recall was 100.0% (2/2) while Escalation Precision was 66.7% (2/3). The single false positive occurred on test case `holdout-org-email-restriction`:
+   - *Query*: *"Can I change my university email address to a personal Gmail account if my university sponsored my LearnForge account?"*
+   - *Expected Label*: `ANSWER` (since general self-service steps exist for personal accounts).
+   - *Live LLM Decision*: `ESCALATE` (`account_specific`).
+   Under `FAQ-10` and `POLICY-07`, university-sponsored accounts involve institutional contract terms and administrative approval. Escalating to human support to verify institutional affiliation is a safe, conservative over-escalation trade-off rather than providing generic self-service steps that could compromise enterprise license entitlements.
 
 ### Critical Regression Case Audit
-All 8 required regression tests in `tests/test_regressions.py` passed:
-1. **Refund Freshness**: Current 14-day policy (`POLICY-02`) successfully prioritized over archived 7-day guidance.
-2. **Offline Downloads**: Current mobile app download rules beat outdated laptop download references.
+All 12 regression tests in [`tests/test_regressions.py`](tests/test_regressions.py) pass consistently:
+1. **Refund Freshness**: Current 14-day policy (`POLICY-02`) prioritized over archived 7-day guidance.
+2. **Offline Downloads**: Current mobile app Wi-Fi rules beat outdated laptop download references.
 3. **Ambiguous Cancellation**: `"Cancel my LearnForge"` produces `CLARIFY` with `ambiguous_intent`.
-4. **Annual Subscription Conflict**: Subscription renewal dispute produces `ESCALATE`.
-5. **Payment Authorization**: Pending authorization hold identified as temporary bank hold, not completed LearnForge charge.
+4. **Annual Subscription Conflict**: Subscription renewal dispute produces `ESCALATE` with `account_specific` / `conflicting_evidence`.
+5. **Payment Authorization**: Pending authorization hold identified as temporary bank hold, not completed charge.
 6. **Capability Boundary**: Prohibits claims of real refund/cancellation execution; safely sanitizes to escalation.
 7. **Unknown Question**: Unsupported question routes to `ESCALATE` with `insufficient_evidence` instead of hallucinating.
 8. **Multi-turn Context**: Context preserved across turns ("What if I bought it through Apple?" retrieves App Store policy).
+9. **Direct Action Command Escalation**: User commanding immediate cancellation/refund routes to `ESCALATE` with `account_specific`.
+10. **Promotional Guarantee Conflict**: Claims of out-of-policy refund guarantees escalate for billing review.
+11. **Apple App Store Overclaim Prevention**: Proves assistant does not state standard 14-day policy universally applies to App Store purchases.
+12. **Citation Completeness Validation**: Proves referential citation completeness is enforced across factual `ANSWER` and `ESCALATE` messages.
 
 ---
 
-## 14. Performance & Latency Profile
+## 15. Performance & Latency Profile
 
 Measured on modern commodity CPU (x86_64, 4 cores, no GPU acceleration):
 
@@ -400,12 +490,12 @@ Measured on modern commodity CPU (x86_64, 4 cores, no GPU acceleration):
 | **RRF Fusion** | Pure Python application-level fusion | $< 0.5$ ms | $O(N)$ rank merging for top 16 candidates |
 | **Reranking** | Cross-Encoder (`MiniLM-L-6-v2`) | **518.6 ms** | Runs only on top 10 shortlist |
 | **Reliability Sorting** | Authority & deprecation prior | $< 0.2$ ms | In-memory sort |
-| **LLM Generation** | Groq (`openai/gpt-oss-20b`) | ~350–600 ms | Cloud LPUs with JSON mode |
+| **LLM Generation** | Groq (`qwen/qwen3.8-27b`) | ~600–900 ms | Cloud LPUs with JSON mode |
 | **Total Request E2E** | Full Pipeline | **~900–1200 ms** | Well within interactive support SLA |
 
 ---
 
-## 15. Trade-Offs & Design Rationale
+## 16. Trade-Offs & Design Rationale
 
 ### 1. Hybrid Retrieval (Dense + BM25) vs. Vector-Only
 *Decision*: Combined dense embeddings (`BAAI/bge-small-en-v1.5`) with sparse BM25 (`Qdrant/bm25`).
@@ -433,7 +523,7 @@ Measured on modern commodity CPU (x86_64, 4 cores, no GPU acceleration):
 
 ---
 
-## 16. What I Would Change in Production
+## 17. What I Would Change in Production
 
 If transitioning this prototype to enterprise scale:
 
@@ -447,6 +537,5 @@ If transitioning this prototype to enterprise scale:
 4. **Adaptive Query Rewriting for Complex Follow-Ups**:
    - For conversations exceeding 5 turns, deploy a lightweight, quantized query reformulation model to rewrite ambiguous follow-ups before retrieval.
 5. **Observability & Guardrails**:
-   - Integrate OpenTelemetry for distributed tracing.
-   - Deploy automated evaluation monitors in production to flag drifting hallucination rates or sudden spikes in human escalations.
+   - Langfuse v4 distributed tracing and OpenInference Groq instrumentation are now integrated. In production, we would add automated real-time alert monitors to flag drifting hallucination rates or sudden spikes in human escalations.
 

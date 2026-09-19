@@ -142,3 +142,4 @@ class ChatResponse(BaseModel):
     citations: list[Citation]  # {"record_id": str, "title": str}
     handoff_summary: str | None = None
 ```
+

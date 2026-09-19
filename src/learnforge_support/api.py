@@ -11,8 +11,10 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 
 from learnforge_support.config import Settings, get_settings
+from learnforge_support.observability import flush_observability, initialize_observability
 from learnforge_support.schemas import ChatRequest, ChatResponse, HealthResponse
 from learnforge_support.service import SupportService
 
@@ -21,9 +23,13 @@ from learnforge_support.service import SupportService
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Initializes models and shared resources once per application lifecycle."""
     settings = get_settings()
+    initialize_observability(settings)
     service = SupportService(settings=settings)
     app.state.service = service
-    yield
+    try:
+        yield
+    finally:
+        flush_observability()
 
 
 app = FastAPI(
@@ -31,6 +37,19 @@ app = FastAPI(
     description="Production-minded AI Customer Support RAG Assistant for LearnForge.",
     version="0.1.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
 
 

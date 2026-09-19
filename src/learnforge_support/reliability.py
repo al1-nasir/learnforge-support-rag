@@ -20,39 +20,26 @@ AUTHORITY_WEIGHTS: dict[str, int] = {
     "historical_example": 3,
 }
 
-# Regex patterns detecting prohibited claims of direct account execution
+# Regex patterns detecting prohibited claims of direct account execution or ticketing actions
 _CAPABILITY_VIOLATION_PATTERNS: list[re.Pattern] = [
-    re.compile(
-        r"\b(?:i(?:'ve| have)?|we(?:'ve| have)?)\s+(?:cancelled|canceled)\s+your\b", re.IGNORECASE
-    ),
-    re.compile(
-        r"\b(?:i(?:'ve| have)?|we(?:'ve| have)?)\s+(?:issued|processed)\s+(?:your|a)\s+refund\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(?:i(?:'ve| have)?|we(?:'ve| have)?)\s+(?:restored|reset)\s+your\s+(?:account|course|progress)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(?:i(?:'ve| have)?|we(?:'ve| have)?)\s+(?:deleted|closed)\s+your\s+account\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(?:i(?:'ve| have)?|we(?:'ve| have)?)\s+(?:checked|verified)\s+your\s+bank\b",
-        re.IGNORECASE,
-    ),
+    re.compile(r"\b(?:i(?:'ve| have)?|we(?:'ve| have)?)\s+(?:cancelled|canceled)\s+your\b", re.IGNORECASE),
+    re.compile(r"\b(?:i(?:'ve| have)?|we(?:'ve| have)?)\s+(?:issued|processed)\s+(?:your|a)\s+refund\b", re.IGNORECASE),
+    re.compile(r"\b(?:i(?:'ve| have)?|we(?:'ve| have)?)\s+(?:restored|reset)\s+your\s+(?:account|course|progress)\b", re.IGNORECASE),
+    re.compile(r"\b(?:i(?:'ve| have)?|we(?:'ve| have)?)\s+(?:deleted|closed)\s+your\s+account\b", re.IGNORECASE),
+    re.compile(r"\b(?:i(?:'ve| have)?|we(?:'ve| have)?)\s+(?:checked|verified)\s+your\s+bank\b", re.IGNORECASE),
+    re.compile(r"\b(?:i(?:'ll| will|'ve| have)?|we(?:'ll| will|'ve| have)?)\s+forward(?:ed)?\b", re.IGNORECASE),
+    re.compile(r"\b(?:i(?:'ve| have)|we(?:'ve| have))\s+sent\b", re.IGNORECASE),
+    re.compile(r"\b(?:i(?:'ll| will)?|we(?:'ll| will)?)\s+send\s+(?:your|this|the|a)\s+(?:ticket|case|request|inquiry|details|message)\b", re.IGNORECASE),
+    re.compile(r"\b(?:i(?:'ve| have)?|we(?:'ve| have)?)\s+escalated\b", re.IGNORECASE),
+    re.compile(r"\b(?:i(?:'ll| will| am|'m)?|we(?:'ll| will| are|'re)?)\s+escalat(?:e|ing)\s+(?:your|this|the|a)\s+(?:ticket|case|request|inquiry|issue)\b", re.IGNORECASE),
+    re.compile(r"\b(?:ticket|case|support request)\s+(?:has been|was|is)\s+(?:created|opened|submitted|forwarded|routed|escalated)\b", re.IGNORECASE),
+    re.compile(r"\b(?:created|opened|submitted|routed)\s+(?:a|the)\s+(?:ticket|case|support request)\b", re.IGNORECASE),
 ]
 
 # Regex patterns detecting illicit requests for user credentials
 _SECURITY_VIOLATION_PATTERNS: list[re.Pattern] = [
-    re.compile(
-        r"\b(?:send|provide|enter)\s+(?:your\s+)?(?:password|pin|cvv|security code)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(?:send|provide)\s+(?:your\s+)?full\s+(?:card|credit card|debit card)\s+number\b",
-        re.IGNORECASE,
-    ),
+    re.compile(r"\b(?:send|provide|enter)\s+(?:your\s+)?(?:password|pin|cvv|security code)\b", re.IGNORECASE),
+    re.compile(r"\b(?:send|provide)\s+(?:your\s+)?full\s+(?:card|credit card|debit card)\s+number\b", re.IGNORECASE),
 ]
 
 
@@ -163,7 +150,8 @@ def sanitize_decision(
             decision="escalate",
             message=(
                 "I cannot directly perform account modifications, cancellations, or refunds. "
-                "I have forwarded your request to LearnForge Support for human assistance."
+                "This request requires human support review. "
+                "Please contact LearnForge Support through your account settings or official support channels."
             ),
             reason_code="account_specific",
             citations=[],
@@ -191,7 +179,8 @@ def sanitize_decision(
             decision="escalate",
             message=(
                 "I do not have sufficient verified documentation to answer this inquiry accurately. "
-                "I am escalating this to our support team."
+                "This request requires review by our support team. "
+                "Please contact LearnForge Support directly."
             ),
             reason_code="insufficient_evidence",
             citations=[],
@@ -205,7 +194,8 @@ def sanitize_decision(
             decision="escalate",
             message=(
                 "I do not have sufficient verified policy documentation to confirm this answer. "
-                "Let me connect you with a support specialist."
+                "This request requires review by our support team. "
+                "Please contact LearnForge Support directly."
             ),
             reason_code="insufficient_evidence",
             citations=[],
@@ -219,3 +209,38 @@ def sanitize_decision(
         citations=clean_cites,
         handoff_summary=decision.handoff_summary,
     )
+
+
+_RECORD_ID_REGEX = re.compile(r"\b(?:POLICY|FAQ|TICKET)-\d+\b", re.IGNORECASE)
+
+
+def check_citation_completeness(
+    decision: SupportDecision,
+    available_record_ids: set[str],
+) -> bool:
+    """Checks whether records referenced in the message are completely and validly cited.
+
+    Specifically verifies:
+    1. For ANSWER decisions: At least one citation is required, and any record ID
+       mentioned in the text that exists in available_record_ids must be cited.
+    2. For CLARIFY / ESCALATE decisions: If record IDs are mentioned in the message text,
+       any mentioned record existing in available_record_ids must be explicitly cited.
+    """
+    mentioned = {
+        m.upper()
+        for m in _RECORD_ID_REGEX.findall(decision.message)
+        if m.upper() in available_record_ids
+    }
+    cited = {c.upper() for c in decision.citations}
+
+    if decision.decision == "answer":
+        if not cited:
+            return False
+        return mentioned.issubset(cited)
+
+    # For clarify or escalate:
+    if mentioned and not mentioned.issubset(cited):
+        return False
+
+    return True
+

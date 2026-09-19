@@ -13,6 +13,7 @@ This is the primary coordinator for the entire request lifecycle. Connects:
 """
 
 import uuid
+from typing import Any
 
 from fastembed import SparseTextEmbedding, TextEmbedding
 from fastembed.rerank.cross_encoder import TextCrossEncoder
@@ -23,6 +24,11 @@ from learnforge_support.conversation import ConversationStore
 from learnforge_support.indexing import get_qdrant_client
 from learnforge_support.llm import LLMClientProtocol, generate_decision
 from learnforge_support.logging_utils import Stopwatch, log_request_event, setup_logger
+from learnforge_support.observability import (
+    create_trace_id,
+    start_child_span,
+    start_support_trace,
+)
 from learnforge_support.prompting import build_chat_messages
 from learnforge_support.reliability import sort_evidence_by_authority
 from learnforge_support.reranking import get_cross_encoder, rerank_candidates
@@ -103,122 +109,211 @@ class SupportService:
         except Exception:
             return 0
 
-    def process_chat(self, request: ChatRequest) -> tuple[ChatResponse, dict[str, float]]:
+    def process_chat(
+        self,
+        request: ChatRequest,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        request_id: str | None = None,
+    ) -> tuple[ChatResponse, dict[str, Any]]:
         """Processes a single customer turn through the full retrieval and reliability pipeline.
 
         Returns (ChatResponse, timings_dict).
         """
-        request_id = str(uuid.uuid4())
+        req_id = request_id or str(uuid.uuid4())
         session_id = request.session_id or str(uuid.uuid4())
         total_timer = Stopwatch()
 
-        # Step 1: Bounded conversation context lookup
-        history = self.conversation_store.get_history(session_id)
+        trace_tags = list(tags) if tags else ["learnforge", "support-rag"]
+        trace_meta = {"request_id": req_id, **(metadata or {})}
 
-        # Step 2: Contextual query formulation
-        retrieval_query = build_retrieval_query(
-            current_message=request.message,
-            recent_turns=history,
-        )
+        with start_support_trace(
+            request_id=req_id,
+            session_id=session_id,
+            message=request.message,
+            tags=trace_tags,
+            metadata=trace_meta,
+        ) as root_obs:
+            # Step 1: Bounded conversation context lookup
+            history = self.conversation_store.get_history(session_id)
 
-        # Step 3: First-stage hybrid retrieval & Reciprocal Rank Fusion
-        retrieval_timer = Stopwatch()
-        fused_candidates: list[EvidenceItem] = []
-        if self.is_index_ready():
-            fused_candidates = hybrid_retrieve(
-                client=self.qdrant_client,
-                collection_name=self.settings.qdrant_collection,
-                query=retrieval_query,
-                dense_model=self.dense_model,
-                sparse_model=self.sparse_model,
-                dense_top_k=self.settings.dense_top_k,
-                sparse_top_k=self.settings.sparse_top_k,
-                rrf_k=self.settings.rrf_k,
-                fused_top_k=self.settings.fused_top_k,
-            )
-        retrieval_ms = retrieval_timer.elapsed_ms()
-
-        # Step 4: Cross-encoder reranking
-        top_evidence: list[EvidenceItem] = []
-        rerank_ms = 0.0
-        if fused_candidates:
-            top_evidence, rerank_ms = rerank_candidates(
-                query=retrieval_query,
-                items=fused_candidates,
-                reranker=self.reranker,
-                final_top_k=self.settings.final_top_k,
+            # Step 2: Contextual query formulation
+            retrieval_query = build_retrieval_query(
+                current_message=request.message,
+                recent_turns=history,
             )
 
-        # Step 5: Source authority and freshness ordering
-        authoritative_evidence = sort_evidence_by_authority(top_evidence)
-        available_record_ids = {item.record.record_id for item in authoritative_evidence}
-
-        # Step 6: LLM generation & reliability decision
-        llm_messages = build_chat_messages(
-            user_message=request.message,
-            evidence_items=authoritative_evidence,
-            conversation_history=history,
-        )
-        decision, llm_ms = generate_decision(
-            messages=llm_messages,
-            available_record_ids=available_record_ids,
-            settings=self.settings,
-            client=self.llm_client,
-        )
-
-        # Step 7: Update session conversation store
-        self.conversation_store.add_turn(
-            session_id=session_id, role="user", content=request.message
-        )
-        self.conversation_store.add_turn(
-            session_id=session_id, role="assistant", content=decision.message
-        )
-
-        # Step 8: Enrich citations with document titles
-        citations: list[Citation] = []
-        for cid in decision.citations:
-            title = self._record_titles.get(cid)
-            if not title:
-                # Attempt lookup from retrieved records
-                match = next(
-                    (
-                        item.record.title
-                        for item in authoritative_evidence
-                        if item.record.record_id == cid
-                    ),
-                    cid,
+            # Step 3: First-stage hybrid retrieval & Reciprocal Rank Fusion
+            retrieval_timer = Stopwatch()
+            fused_candidates: list[EvidenceItem] = []
+            with start_child_span(
+                "hybrid-retrieval",
+                input_data={"query": retrieval_query},
+                metadata={
+                    "dense_top_k": self.settings.dense_top_k,
+                    "sparse_top_k": self.settings.sparse_top_k,
+                    "rrf_k": self.settings.rrf_k,
+                    "fused_top_k": self.settings.fused_top_k,
+                },
+            ) as ret_span:
+                if self.is_index_ready():
+                    fused_candidates = hybrid_retrieve(
+                        client=self.qdrant_client,
+                        collection_name=self.settings.qdrant_collection,
+                        query=retrieval_query,
+                        dense_model=self.dense_model,
+                        sparse_model=self.sparse_model,
+                        dense_top_k=self.settings.dense_top_k,
+                        sparse_top_k=self.settings.sparse_top_k,
+                        rrf_k=self.settings.rrf_k,
+                        fused_top_k=self.settings.fused_top_k,
+                    )
+                ret_span.update(
+                    output={
+                        "candidate_count": len(fused_candidates),
+                        "candidate_record_ids": [item.record.record_id for item in fused_candidates],
+                    }
                 )
-                title = match
-            citations.append(Citation(record_id=cid, title=title))
+            retrieval_ms = retrieval_timer.elapsed_ms()
 
-        total_ms = total_timer.elapsed_ms()
+            # Step 4: Cross-encoder reranking
+            top_evidence: list[EvidenceItem] = []
+            rerank_ms = 0.0
+            with start_child_span(
+                "cross-encoder-reranking",
+                input_data={
+                    "query": retrieval_query,
+                    "candidate_count": len(fused_candidates),
+                    "candidate_record_ids": [item.record.record_id for item in fused_candidates],
+                },
+                metadata={
+                    "final_top_k": self.settings.final_top_k,
+                    "rerank_model": self.settings.rerank_model,
+                },
+            ) as rerank_span:
+                if fused_candidates:
+                    top_evidence, rerank_ms = rerank_candidates(
+                        query=retrieval_query,
+                        items=fused_candidates,
+                        reranker=self.reranker,
+                        final_top_k=self.settings.final_top_k,
+                    )
+                rerank_span.update(
+                    output={
+                        "top_count": len(top_evidence),
+                        "top_record_ids": [item.record.record_id for item in top_evidence],
+                        "scores": [round(item.reranker_score, 4) for item in top_evidence],
+                        "rerank_ms": round(rerank_ms, 2),
+                    }
+                )
 
-        # Step 9: Structured telemetry logging
-        log_request_event(
-            logger=logger,
-            request_id=request_id,
-            session_id=session_id,
-            decision=decision.decision,
-            reason_code=decision.reason_code,
-            retrieved_record_ids=list(available_record_ids),
-            retrieval_ms=retrieval_ms,
-            rerank_ms=rerank_ms,
-            llm_ms=llm_ms,
-            total_ms=total_ms,
-        )
+            # Step 5: Source authority and freshness ordering
+            with start_child_span(
+                "reliability-check",
+                input_data={
+                    "top_evidence_ids": [item.record.record_id for item in top_evidence],
+                },
+            ) as rel_span:
+                authoritative_evidence = sort_evidence_by_authority(top_evidence)
+                available_record_ids = {item.record.record_id for item in authoritative_evidence}
+                rel_span.update(
+                    output={
+                        "authoritative_record_ids": list(available_record_ids),
+                        "count": len(available_record_ids),
+                    }
+                )
 
-        response = ChatResponse(
-            session_id=session_id,
-            decision=decision.decision,
-            message=decision.message,
-            reason_code=decision.reason_code,
-            citations=citations,
-            handoff_summary=decision.handoff_summary,
-        )
-        timings = {
+            # Step 6: LLM generation & reliability decision
+            llm_messages = build_chat_messages(
+                user_message=request.message,
+                evidence_items=authoritative_evidence,
+                conversation_history=history,
+            )
+            decision, llm_ms = generate_decision(
+                messages=llm_messages,
+                available_record_ids=available_record_ids,
+                settings=self.settings,
+                client=self.llm_client,
+            )
+
+            # Step 7: Update session conversation store
+            self.conversation_store.add_turn(session_id=session_id, role="user", content=request.message)
+            self.conversation_store.add_turn(session_id=session_id, role="assistant", content=decision.message)
+
+            # Step 8: Enrich citations with document titles
+            with start_child_span(
+                "response-validation",
+                input_data={
+                    "decision": decision.decision,
+                    "reason_code": decision.reason_code,
+                    "citations": decision.citations,
+                },
+                metadata={"available_record_count": len(available_record_ids)},
+            ) as val_span:
+                citations: list[Citation] = []
+                for cid in decision.citations:
+                    title = self._record_titles.get(cid)
+                    if not title:
+                        match = next((item.record.title for item in authoritative_evidence if item.record.record_id == cid), cid)
+                        title = match
+                    citations.append(Citation(record_id=cid, title=title))
+                val_span.update(
+                    output={
+                        "final_decision": decision.decision,
+                        "citations_count": len(citations),
+                        "citations": [c.record_id for c in citations],
+                    }
+                )
+
+            total_ms = total_timer.elapsed_ms()
+
+            # Step 9: Structured telemetry logging
+            log_request_event(
+                logger=logger,
+                request_id=req_id,
+                session_id=session_id,
+                decision=decision.decision,
+                reason_code=decision.reason_code,
+                retrieved_record_ids=list(available_record_ids),
+                retrieval_ms=retrieval_ms,
+                rerank_ms=rerank_ms,
+                llm_ms=llm_ms,
+                total_ms=total_ms,
+            )
+
+            response = ChatResponse(
+                session_id=session_id,
+                decision=decision.decision,
+                message=decision.message,
+                reason_code=decision.reason_code,
+                citations=citations,
+                handoff_summary=decision.handoff_summary,
+            )
+
+            root_obs.update(
+                output={
+                    "decision": response.decision,
+                    "reason_code": response.reason_code,
+                    "citations": [c.record_id for c in response.citations],
+                    "message": response.message,
+                    "handoff_summary": response.handoff_summary,
+                },
+                metadata={
+                    "retrieval_ms": round(retrieval_ms, 2),
+                    "rerank_ms": round(rerank_ms, 2),
+                    "llm_ms": round(llm_ms, 2),
+                    "total_ms": round(total_ms, 2),
+                },
+            )
+
+        trace_id = create_trace_id(seed=req_id)
+        timings: dict[str, Any] = {
             "retrieval_ms": round(retrieval_ms, 2),
             "rerank_ms": round(rerank_ms, 2),
             "llm_ms": round(llm_ms, 2),
             "total_ms": round(total_ms, 2),
+            "request_id": req_id,
+            "trace_id": trace_id,
         }
         return response, timings
+

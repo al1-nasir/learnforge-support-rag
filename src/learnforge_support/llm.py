@@ -6,9 +6,10 @@ Falls back safely to an escalation response on provider failures.
 """
 
 import json
+import time
 from typing import Protocol
 
-from groq import Groq
+from groq import Groq, RateLimitError
 
 from learnforge_support.config import Settings
 from learnforge_support.logging_utils import Stopwatch, setup_logger
@@ -43,16 +44,32 @@ class GroqLLMClient:
         messages: list[dict[str, str]],
         temperature: float = 0.0,
     ) -> str:
-        completion = self.client.chat.completions.create(
-            model=model,
-            messages=messages,  # type: ignore[arg-type]
-            response_format={"type": "json_object"},
-            temperature=temperature,
-        )
-        content = completion.choices[0].message.content
-        if not content:
-            raise ValueError("Groq returned empty response content")
-        return content
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                completion = self.client.chat.completions.create(
+                    model=model,
+                    messages=messages,  # type: ignore[arg-type]
+                    response_format={"type": "json_object"},
+                    temperature=temperature,
+                    max_tokens=600,
+                )
+                content = completion.choices[0].message.content
+                if not content:
+                    raise ValueError("Groq returned empty response content")
+                return content
+            except RateLimitError as rle:
+                if attempt < max_attempts - 1:
+                    wait_s = 2.0 * (attempt + 1)
+                    logger.warning(
+                        "Groq rate limit encountered (attempt %d/%d). Backing off for %.1fs...",
+                        attempt + 1,
+                        max_attempts,
+                        wait_s,
+                    )
+                    time.sleep(wait_s)
+                else:
+                    raise rle
 
 
 def parse_and_validate_decision(raw_json: str, available_record_ids: set[str]) -> SupportDecision:
@@ -140,7 +157,8 @@ def generate_decision(
                 decision="escalate",
                 message=(
                     "I am currently unable to process this request reliably. "
-                    "I have escalated your question to LearnForge human support."
+                    "This inquiry requires human support review. "
+                    "Please contact LearnForge Support directly."
                 ),
                 reason_code="insufficient_evidence",
                 citations=[],
