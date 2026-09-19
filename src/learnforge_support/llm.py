@@ -6,7 +6,9 @@ Falls back safely to an escalation response on provider failures.
 """
 
 import json
+import re
 import time
+from threading import Lock
 from typing import Protocol
 
 from groq import Groq, RateLimitError
@@ -33,10 +35,17 @@ class LLMClientProtocol(Protocol):
 
 
 class GroqLLMClient:
-    """Production LLM client utilizing the official Groq SDK."""
+    """Groq client with process-local request pacing and bounded 429 retries."""
 
-    def __init__(self, api_key: str) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        min_request_interval_seconds: float = 2.0,
+        rate_limit_max_attempts: int = 3,
+    ) -> None:
         self.client = Groq(api_key=api_key)
+        self._pacer = RequestPacer(min_request_interval_seconds)
+        self._rate_limit_max_attempts = rate_limit_max_attempts
 
     def complete_chat(
         self,
@@ -44,9 +53,9 @@ class GroqLLMClient:
         messages: list[dict[str, str]],
         temperature: float = 0.0,
     ) -> str:
-        max_attempts = 3
-        for attempt in range(max_attempts):
+        for attempt in range(self._rate_limit_max_attempts):
             try:
+                self._pacer.wait()
                 completion = self.client.chat.completions.create(
                     model=model,
                     messages=messages,  # type: ignore[arg-type]
@@ -59,17 +68,85 @@ class GroqLLMClient:
                     raise ValueError("Groq returned empty response content")
                 return content
             except RateLimitError as rle:
-                if attempt < max_attempts - 1:
-                    wait_s = 2.0 * (attempt + 1)
+                if attempt < self._rate_limit_max_attempts - 1:
+                    wait_s = rate_limit_retry_delay(rle, attempt)
+                    if wait_s is None:
+                        logger.warning(
+                            "Groq rate limit will not reset within the request retry window."
+                        )
+                        raise rle
                     logger.warning(
                         "Groq rate limit encountered (attempt %d/%d). Backing off for %.1fs...",
                         attempt + 1,
-                        max_attempts,
+                        self._rate_limit_max_attempts,
                         wait_s,
                     )
                     time.sleep(wait_s)
                 else:
                     raise rle
+
+
+class RequestPacer:
+    """Coordinates Groq calls made by one application process.
+
+    Groq also enforces account-level limits. This small local guard reduces avoidable
+    bursts from concurrent browser requests; it is not presented as a replacement for
+    provider limits or a distributed rate limiter.
+    """
+
+    def __init__(self, min_interval_seconds: float) -> None:
+        self._min_interval_seconds = min_interval_seconds
+        self._lock = Lock()
+        self._next_request_at = 0.0
+
+    def wait(self) -> None:
+        if self._min_interval_seconds <= 0:
+            return
+
+        with self._lock:
+            now = time.monotonic()
+            wait_seconds = max(0.0, self._next_request_at - now)
+            self._next_request_at = max(now, self._next_request_at) + self._min_interval_seconds
+
+        if wait_seconds:
+            time.sleep(wait_seconds)
+
+
+def rate_limit_retry_delay(error: RateLimitError, attempt: int) -> float | None:
+    """Returns a short retry delay, or None when the provider reset is too far away."""
+    headers = getattr(getattr(error, "response", None), "headers", {})
+    retry_after = headers.get("retry-after") if headers else None
+    delay_candidates: list[float] = []
+    if retry_after:
+        try:
+            delay_candidates.append(float(retry_after))
+        except ValueError:
+            pass
+
+    message_delay = _provider_reset_delay_seconds(str(error))
+    if message_delay is not None:
+        delay_candidates.append(message_delay)
+
+    if delay_candidates:
+        provider_delay = max(delay_candidates)
+        if provider_delay > 30.0:
+            return None
+        return provider_delay
+    return min(2.0**attempt, 8.0)
+
+
+def _provider_reset_delay_seconds(message: str) -> float | None:
+    """Parses Groq's human-readable `try again in 15m24s` quota message."""
+    match = re.search(
+        r"try again in\s+(?:(?P<minutes>\d+)m)?(?P<seconds>\d+(?:\.\d+)?)s",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    minutes = float(match.group("minutes") or 0)
+    seconds = float(match.group("seconds"))
+    return minutes * 60 + seconds
 
 
 def parse_and_validate_decision(raw_json: str, available_record_ids: set[str]) -> SupportDecision:
@@ -108,7 +185,11 @@ def generate_decision(
                 ),
                 stopwatch.elapsed_ms(),
             )
-        llm_client = GroqLLMClient(api_key=settings.groq_api_key)
+        llm_client = GroqLLMClient(
+            api_key=settings.groq_api_key,
+            min_request_interval_seconds=settings.llm_min_request_interval_seconds,
+            rate_limit_max_attempts=settings.llm_rate_limit_max_attempts,
+        )
 
     # First generation attempt
     attempt_messages = list(messages)
@@ -120,6 +201,24 @@ def generate_decision(
         )
         decision = parse_and_validate_decision(raw_output, available_record_ids)
         return decision, stopwatch.elapsed_ms()
+    except RateLimitError:
+        logger.warning(
+            "Groq rate limit persisted after %d attempts.",
+            settings.llm_rate_limit_max_attempts,
+        )
+        return (
+            SupportDecision(
+                decision="escalate",
+                message=(
+                    "LearnForge Support is temporarily busy. Please try your request again shortly, "
+                    "or contact LearnForge Support directly if it is urgent."
+                ),
+                reason_code="insufficient_evidence",
+                citations=[],
+                handoff_summary="Groq rate limit persisted after bounded retries.",
+            ),
+            stopwatch.elapsed_ms(),
+        )
     except Exception as first_exc:
         logger.warning(
             "First LLM structured output attempt failed (%s: %s). Initiating single retry.",

@@ -30,7 +30,7 @@ class NullObservation:
     """Safe no-op observation object returned when observability is disabled or unavailable."""
 
     def update(self, **kwargs: Any) -> None:
-        pass
+        return None
 
 
 def is_observability_enabled() -> bool:
@@ -68,7 +68,6 @@ def initialize_observability(settings: Settings) -> None:
         return
 
     try:
-        # Propagate environment settings so Otel and Langfuse internals share the configuration
         os.environ["LANGFUSE_PUBLIC_KEY"] = pub_key
         os.environ["LANGFUSE_SECRET_KEY"] = sec_key
         base_url = settings.langfuse_base_url.strip() or "https://cloud.langfuse.com"
@@ -89,7 +88,6 @@ def initialize_observability(settings: Settings) -> None:
             )
             return
 
-        # Instrument Groq OpenInference exactly once
         if not _groq_instrumented:
             instrumentor = GroqInstrumentor()
             if not instrumentor.is_instrumented_by_opentelemetry:
@@ -135,7 +133,7 @@ def shutdown_observability() -> None:
 
 
 def create_trace_id(seed: str | None = None) -> str:
-    """Creates a deterministic 32-character hexadecimal trace ID seeded by request_id."""
+    """Creates a trace ID correlated with a request ID without exposing it to users."""
     try:
         return Langfuse.create_trace_id(seed=seed)
     except Exception:
@@ -156,7 +154,7 @@ def start_support_trace(
     tags: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> Iterator[Any]:
-    """Context manager wrapping SupportService.process_chat() in a root 'support-request' span."""
+    """Starts the root support-request trace for one customer turn."""
     if not is_observability_enabled() or _client is None:
         yield NullObservation()
         return
@@ -173,8 +171,7 @@ def start_support_trace(
         ) as root_obs:
             env = environment or _tracing_environment
             combined_tags = list(tags) if tags else ["learnforge", "support-rag"]
-            trace_meta = dict(metadata) if metadata else {}
-            trace_meta["request_id"] = request_id
+            trace_meta = {"request_id": request_id, **(metadata or {})}
 
             with propagate_attributes(
                 session_id=session_id,
@@ -194,7 +191,7 @@ def start_child_span(
     input_data: Any = None,
     metadata: Any = None,
 ) -> Iterator[Any]:
-    """Context manager creating a child span under the active support-request observation."""
+    """Starts a coarse pipeline-stage span under the active request trace."""
     if not is_observability_enabled() or _client is None:
         yield NullObservation()
         return

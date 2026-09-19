@@ -22,7 +22,7 @@ from qdrant_client import QdrantClient
 from learnforge_support.config import Settings
 from learnforge_support.conversation import ConversationStore
 from learnforge_support.indexing import get_qdrant_client
-from learnforge_support.llm import LLMClientProtocol, generate_decision
+from learnforge_support.llm import GroqLLMClient, LLMClientProtocol, generate_decision
 from learnforge_support.logging_utils import Stopwatch, log_request_event, setup_logger
 from learnforge_support.observability import (
     create_trace_id,
@@ -61,14 +61,22 @@ class SupportService:
         self.dense_model = dense_model or TextEmbedding(model_name=settings.dense_model)
         self.sparse_model = sparse_model or SparseTextEmbedding(model_name=settings.sparse_model)
         self.reranker = reranker or get_cross_encoder(model_name=settings.rerank_model)
-        self.llm_client = llm_client
+        self.llm_client = llm_client or self._build_llm_client()
         self.conversation_store = conversation_store or ConversationStore(
             max_turns=settings.max_conversation_turns
         )
 
-        # Cache of record titles for rapid citation formatting
         self._record_titles: dict[str, str] = {}
         self._load_record_titles_cache()
+
+    def _build_llm_client(self) -> LLMClientProtocol | None:
+        if not self.settings.groq_api_key:
+            return None
+        return GroqLLMClient(
+            api_key=self.settings.groq_api_key,
+            min_request_interval_seconds=self.settings.llm_min_request_interval_seconds,
+            rate_limit_max_attempts=self.settings.llm_rate_limit_max_attempts,
+        )
 
     def _load_record_titles_cache(self) -> None:
         """Loads record IDs and titles from Qdrant into memory for citation labeling."""
@@ -134,16 +142,12 @@ class SupportService:
             tags=trace_tags,
             metadata=trace_meta,
         ) as root_obs:
-            # Step 1: Bounded conversation context lookup
             history = self.conversation_store.get_history(session_id)
-
-            # Step 2: Contextual query formulation
             retrieval_query = build_retrieval_query(
                 current_message=request.message,
                 recent_turns=history,
             )
 
-            # Step 3: First-stage hybrid retrieval & Reciprocal Rank Fusion
             retrieval_timer = Stopwatch()
             fused_candidates: list[EvidenceItem] = []
             with start_child_span(
@@ -176,7 +180,6 @@ class SupportService:
                 )
             retrieval_ms = retrieval_timer.elapsed_ms()
 
-            # Step 4: Cross-encoder reranking
             top_evidence: list[EvidenceItem] = []
             rerank_ms = 0.0
             with start_child_span(
@@ -207,7 +210,6 @@ class SupportService:
                     }
                 )
 
-            # Step 5: Source authority and freshness ordering
             with start_child_span(
                 "reliability-check",
                 input_data={
@@ -216,14 +218,26 @@ class SupportService:
             ) as rel_span:
                 authoritative_evidence = sort_evidence_by_authority(top_evidence)
                 available_record_ids = {item.record.record_id for item in authoritative_evidence}
+                evidence_summary = [
+                    {
+                        "record_id": item.record.record_id,
+                        "source_type": item.record.source_type,
+                        "authority_tier": item.record.authority_tier,
+                        "temporal_status": item.record.temporal_status,
+                        "contains_deprecated_reference": item.record.contains_deprecated_reference,
+                    }
+                    for item in authoritative_evidence
+                ]
                 rel_span.update(
                     output={
-                        "authoritative_record_ids": list(available_record_ids),
+                        "authoritative_record_ids": [
+                            item.record.record_id for item in authoritative_evidence
+                        ],
                         "count": len(available_record_ids),
+                        "evidence": evidence_summary,
                     }
                 )
 
-            # Step 6: LLM generation & reliability decision
             llm_messages = build_chat_messages(
                 user_message=request.message,
                 evidence_items=authoritative_evidence,
@@ -236,11 +250,9 @@ class SupportService:
                 client=self.llm_client,
             )
 
-            # Step 7: Update session conversation store
             self.conversation_store.add_turn(session_id=session_id, role="user", content=request.message)
             self.conversation_store.add_turn(session_id=session_id, role="assistant", content=decision.message)
 
-            # Step 8: Enrich citations with document titles
             with start_child_span(
                 "response-validation",
                 input_data={
@@ -260,21 +272,22 @@ class SupportService:
                 val_span.update(
                     output={
                         "final_decision": decision.decision,
+                        "reason_code": decision.reason_code,
                         "citations_count": len(citations),
                         "citations": [c.record_id for c in citations],
+                        "handoff_required": decision.handoff_summary is not None,
                     }
                 )
 
             total_ms = total_timer.elapsed_ms()
 
-            # Step 9: Structured telemetry logging
             log_request_event(
                 logger=logger,
                 request_id=req_id,
                 session_id=session_id,
                 decision=decision.decision,
                 reason_code=decision.reason_code,
-                retrieved_record_ids=list(available_record_ids),
+                retrieved_record_ids=[item.record.record_id for item in authoritative_evidence],
                 retrieval_ms=retrieval_ms,
                 rerank_ms=rerank_ms,
                 llm_ms=llm_ms,
@@ -299,6 +312,7 @@ class SupportService:
                     "handoff_summary": response.handoff_summary,
                 },
                 metadata={
+                    "actual_decision": response.decision,
                     "retrieval_ms": round(retrieval_ms, 2),
                     "rerank_ms": round(rerank_ms, 2),
                     "llm_ms": round(llm_ms, 2),
@@ -316,4 +330,3 @@ class SupportService:
             "trace_id": trace_id,
         }
         return response, timings
-

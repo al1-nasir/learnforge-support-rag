@@ -30,6 +30,18 @@ class Settings(BaseSettings):
         default="openai/gpt-oss-20b",
         description="Default model identifier to use on the Groq platform.",
     )
+    llm_min_request_interval_seconds: float = Field(
+        default=2.0,
+        ge=0.0,
+        le=60.0,
+        description="Minimum delay between Groq requests made by this application process.",
+    )
+    llm_rate_limit_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+        description="Maximum provider attempts for one Groq rate-limited completion.",
+    )
 
     # Storage & Indexing Paths
     qdrant_path: str = Field(

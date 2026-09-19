@@ -5,9 +5,11 @@ citation rejection, and bounded retry error handling.
 """
 
 import pytest
+from groq import RateLimitError
+from httpx import Request, Response
 
 from learnforge_support.config import Settings
-from learnforge_support.llm import generate_decision
+from learnforge_support.llm import generate_decision, rate_limit_retry_delay
 from learnforge_support.reliability import (
     CitationValidationError,
     sanitize_decision,
@@ -166,3 +168,60 @@ def test_llm_both_attempts_fail_safe_fallback():
     assert mock_client.call_count == 2
     assert decision.decision == "escalate"
     assert decision.reason_code == "insufficient_evidence"
+
+
+def test_rate_limit_retry_delay_uses_provider_hint():
+    """Verify provider Retry-After takes precedence over the fallback backoff."""
+    error = RateLimitError(
+        "Rate limited",
+        response=Response(
+            429,
+            headers={"retry-after": "4"},
+            request=Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
+        ),
+        body={},
+    )
+
+    assert rate_limit_retry_delay(error, attempt=2) == 4.0
+
+
+def test_rate_limit_retry_delay_skips_long_daily_quota_reset():
+    """Verify a daily token limit does not trigger retries that cannot succeed."""
+    error = RateLimitError(
+        "Try again in 15m24.9s.",
+        response=Response(
+            429,
+            headers={"retry-after": "30"},
+            request=Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
+        ),
+        body={},
+    )
+
+    assert rate_limit_retry_delay(error, attempt=0) is None
+
+
+def test_llm_rate_limit_returns_temporary_unavailability():
+    """Verify a persistent provider limit does not trigger an additional JSON retry."""
+
+    class RateLimitedClient:
+        def complete_chat(
+            self, model: str, messages: list[dict[str, str]], temperature: float = 0.0
+        ) -> str:
+            raise RateLimitError(
+                "Rate limited",
+                response=Response(
+                    429,
+                    request=Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
+                ),
+                body={},
+            )
+
+    decision, _ = generate_decision(
+        messages=[{"role": "user", "content": "test"}],
+        available_record_ids={"POLICY-02"},
+        settings=Settings(groq_api_key="mock-key"),
+        client=RateLimitedClient(),
+    )
+
+    assert decision.decision == "escalate"
+    assert "temporarily busy" in decision.message.lower()

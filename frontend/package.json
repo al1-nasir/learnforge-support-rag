@@ -13,11 +13,9 @@
     "@assistant-ui/react": "^0.15.21",
     "@assistant-ui/react-markdown": "^0.14.16",
     "@tailwindcss/vite": "^4.3.3",
-    "clsx": "^2.1.1",
     "lucide-react": "^1.47.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
-    "tailwind-merge": "^3.7.0",
     "tailwindcss": "^4.3.3"
   },
   "devDependencies": {

@@ -197,6 +197,7 @@ def run_evaluation(
                 "eval_case_id": cid,
                 "eval_dataset": dataset_name,
                 "eval_category": category,
+                "expected_decision": expected_decision,
             }
             chat_res, chat_timings = service.process_chat(
                 chat_req,
@@ -229,6 +230,7 @@ def run_evaluation(
             # 3. Citation validity & Hallucination check
             cited_ids = {c.record_id for c in chat_res.citations}
             citations_valid = False
+            has_unsupported_claim = False
             if chat_res.decision == "answer":
                 total_answers += 1
                 # Whitelist check: all cited IDs must be in top_5 retrieved
@@ -237,12 +239,14 @@ def run_evaluation(
                     citations_valid = True
                 else:
                     unsupported_claims_count += 1
+                    has_unsupported_claim = True
             elif chat_res.decision in ("clarify", "escalate"):
                 # Non-answers should have valid citations (empty or verified)
                 if cited_ids.issubset(set(retrieved_ids)):
                     citations_valid = True
                 else:
                     unsupported_claims_count += 1
+                    has_unsupported_claim = True
 
             # 3b. Citation completeness check
             decision_obj = SupportDecision(
@@ -259,6 +263,7 @@ def run_evaluation(
             # For unknown questions, answering is a hallucination
             if category == "unknown" and chat_res.decision == "answer":
                 unsupported_claims_count += 1
+                has_unsupported_claim = True
 
             # 4. Expected source accuracy
             if expected_sources:
@@ -294,6 +299,7 @@ def run_evaluation(
                 "decision_correct": decision_match,
                 "citations_valid": citations_valid,
                 "citation_complete": citation_complete,
+                "unsupported_claim": has_unsupported_claim,
                 "timings_ms": chat_timings,
             }
 
@@ -301,24 +307,41 @@ def run_evaluation(
             if trace_id:
                 record_eval_score(
                     trace_id=trace_id,
-                    name="decision_accuracy",
+                    name="decision_correct",
                     value=1 if decision_match else 0,
                     comment=f"expected: {expected_decision}, actual: {chat_res.decision}",
                 )
                 record_eval_score(
                     trace_id=trace_id,
-                    name="citation_validity",
-                    value=1 if citations_valid else 0,
-                )
-                record_eval_score(
-                    trace_id=trace_id,
-                    name="citation_completeness",
-                    value=1 if citation_complete else 0,
-                )
-                record_eval_score(
-                    trace_id=trace_id,
-                    name="retrieval_hit",
+                    name="retrieval_hit_at_5",
                     value=1 if hit else 0,
+                )
+                if chat_res.decision == "answer" or cited_ids:
+                    record_eval_score(
+                        trace_id=trace_id,
+                        name="citation_valid",
+                        value=1 if citations_valid else 0,
+                    )
+                    record_eval_score(
+                        trace_id=trace_id,
+                        name="citation_complete",
+                        value=1 if citation_complete else 0,
+                    )
+                if expected_sources:
+                    expected_source_correct = bool(
+                        cited_ids.intersection(expected_sources)
+                        if chat_res.decision == "answer"
+                        else set(retrieved_ids).intersection(expected_sources)
+                    )
+                    record_eval_score(
+                        trace_id=trace_id,
+                        name="expected_source_correct",
+                        value=1 if expected_source_correct else 0,
+                    )
+                record_eval_score(
+                    trace_id=trace_id,
+                    name="unsupported_claim",
+                    value=1 if has_unsupported_claim else 0,
                 )
 
             status_symbol = "✓" if decision_match else "✗"
@@ -535,4 +558,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
