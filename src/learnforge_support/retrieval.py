@@ -5,8 +5,7 @@ first-stage dense semantic retrieval, first-stage BM25 sparse retrieval,
 and Reciprocal Rank Fusion (RRF) candidate fusion.
 """
 
-from collections.abc import Sequence
-
+from typing import Sequence
 from fastembed import SparseTextEmbedding, TextEmbedding
 from qdrant_client import QdrantClient
 from qdrant_client.models import SparseVector
@@ -111,10 +110,12 @@ def reciprocal_rank_fusion(
     where rank_m(d) is 1-indexed. Does not sum raw dense/BM25 scores.
     """
     dense_ranks: dict[str, int] = {
-        record.record_id: rank for rank, record in enumerate(dense_candidates, start=1)
+        record.record_id: rank
+        for rank, record in enumerate(dense_candidates, start=1)
     }
     sparse_ranks: dict[str, int] = {
-        record.record_id: rank for rank, record in enumerate(sparse_candidates, start=1)
+        record.record_id: rank
+        for rank, record in enumerate(sparse_candidates, start=1)
     }
 
     # Gather all unique records by record_id
@@ -186,3 +187,4 @@ def hybrid_retrieve(
         rrf_k=rrf_k,
         fused_top_k=fused_top_k,
     )
+

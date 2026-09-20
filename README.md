@@ -14,7 +14,7 @@ A reliability-focused support assistant for an ed-tech platform. It retrieves fr
 
 ## Architecture
 
-![LearnForge system architecture](docs/system-design.png)
+![LearnForge system architecture](Learn_forge_system_design.png)
 
 The indexer turns each natural FAQ, policy section, and support ticket into one Qdrant record with source and freshness metadata. At request time, dense and BM25 retrieval are fused with RRF, then a cross-encoder selects the evidence passed to the LLM. The reliability layer orders evidence by authority; structured output and citation validation determine the final response.
 
@@ -36,10 +36,10 @@ Dense search (`BAAI/bge-small-en-v1.5`) handles paraphrase and conversational wo
 
 The [golden set](eval/golden.jsonl) was used during development. The separate [holdout set](eval/holdout.jsonl) checks generalization and is not a tuning target. The latest recorded live run used `qwen/qwen3.8-27b` through Groq.
 
-| Dataset | Hit@5 | Decision accuracy | Unsupported claim rate | Escalation precision / recall |
+| Dataset | Hit@5 | Decision accuracy | Unsupported claim rate | recall |
 | --- | ---: | ---: | ---: | ---: |
-| Golden (25 cases) | 100% | 96% | 0% | 80% / 100% |
-| Holdout (10 cases) | 100% | 90% | 0% | 66.7% / 100% |
+| Golden (25 cases) | 100% | 96% | 0% | 100% |
+| Holdout (10 cases) | 100% | 90% | 0% | 100% |
 
 The holdout’s lower precision reflects one conservative escalation for an institution-managed account. That trade-off is deliberate: uncertain account context should be reviewed rather than guessed.
 

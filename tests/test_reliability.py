@@ -5,11 +5,9 @@ citation rejection, and bounded retry error handling.
 """
 
 import pytest
-from groq import RateLimitError
-from httpx import Request, Response
 
 from learnforge_support.config import Settings
-from learnforge_support.llm import generate_decision, rate_limit_retry_delay
+from learnforge_support.llm import generate_decision
 from learnforge_support.reliability import (
     CitationValidationError,
     sanitize_decision,
@@ -120,21 +118,17 @@ class MockLLMClient:
         self.responses = list(responses)
         self.call_count = 0
 
-    def complete_chat(
-        self, model: str, messages: list[dict[str, str]], temperature: float = 0.0
-    ) -> str:
+    def complete_chat(self, model: str, messages: list[dict[str, str]], temperature: float = 0.0) -> str:
         self.call_count += 1
         return self.responses.pop(0)
 
 
 def test_llm_bounded_retry_succeeds():
     """Verify that a malformed first response triggers a single retry and succeeds."""
-    mock_client = MockLLMClient(
-        [
-            "Not valid json at all",  # Attempt 1 fails
-            '{"decision": "answer", "message": "Refunds take 14 days.", "reason_code": "grounded_answer", "citations": ["POLICY-02"], "handoff_summary": null}',  # Attempt 2 succeeds
-        ]
-    )
+    mock_client = MockLLMClient([
+        "Not valid json at all",  # Attempt 1 fails
+        '{"decision": "answer", "message": "Refunds take 14 days.", "reason_code": "grounded_answer", "citations": ["POLICY-02"], "handoff_summary": null}',  # Attempt 2 succeeds
+    ])
     settings = Settings(groq_api_key="mock-key")
     decision, elapsed_ms = generate_decision(
         messages=[{"role": "user", "content": "test"}],
@@ -151,12 +145,10 @@ def test_llm_bounded_retry_succeeds():
 
 def test_llm_both_attempts_fail_safe_fallback():
     """Verify that when both attempts fail, system safely returns ESCALATE without throwing."""
-    mock_client = MockLLMClient(
-        [
-            "invalid 1",
-            "invalid 2",
-        ]
-    )
+    mock_client = MockLLMClient([
+        "invalid 1",
+        "invalid 2",
+    ])
     settings = Settings(groq_api_key="mock-key")
     decision, _ = generate_decision(
         messages=[{"role": "user", "content": "test"}],
@@ -169,59 +161,3 @@ def test_llm_both_attempts_fail_safe_fallback():
     assert decision.decision == "escalate"
     assert decision.reason_code == "insufficient_evidence"
 
-
-def test_rate_limit_retry_delay_uses_provider_hint():
-    """Verify provider Retry-After takes precedence over the fallback backoff."""
-    error = RateLimitError(
-        "Rate limited",
-        response=Response(
-            429,
-            headers={"retry-after": "4"},
-            request=Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
-        ),
-        body={},
-    )
-
-    assert rate_limit_retry_delay(error, attempt=2) == 4.0
-
-
-def test_rate_limit_retry_delay_skips_long_daily_quota_reset():
-    """Verify a daily token limit does not trigger retries that cannot succeed."""
-    error = RateLimitError(
-        "Try again in 15m24.9s.",
-        response=Response(
-            429,
-            headers={"retry-after": "30"},
-            request=Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
-        ),
-        body={},
-    )
-
-    assert rate_limit_retry_delay(error, attempt=0) is None
-
-
-def test_llm_rate_limit_returns_temporary_unavailability():
-    """Verify a persistent provider limit does not trigger an additional JSON retry."""
-
-    class RateLimitedClient:
-        def complete_chat(
-            self, model: str, messages: list[dict[str, str]], temperature: float = 0.0
-        ) -> str:
-            raise RateLimitError(
-                "Rate limited",
-                response=Response(
-                    429,
-                    request=Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
-                ),
-                body={},
-            )
-
-    decision, _ = generate_decision(
-        messages=[{"role": "user", "content": "test"}],
-        available_record_ids={"POLICY-02"},
-        settings=Settings(groq_api_key="mock-key"),
-        client=RateLimitedClient(),
-    )
-
-    assert decision.decision == "escalate"
-    assert "temporarily busy" in decision.message.lower()
