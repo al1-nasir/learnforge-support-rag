@@ -2,7 +2,7 @@
 
 A reliability-focused support assistant for an ed-tech platform. It retrieves from a small internal knowledge base, distinguishes current policy from historical support examples, and returns one of three bounded outcomes: `ANSWER`, `CLARIFY`, or `ESCALATE`.
 
-[Architecture](#architecture) · [Evaluation](#evaluation) · [Data schema](DATA_SCHEMA.md)
+[Architecture](#architecture) · [Evaluation](#evaluation) · [Data schema PDF](output/pdf/learnforge-data-schema.pdf)
 
 ## What it does
 
@@ -115,7 +115,7 @@ ruff check .
 
 ## Data schema
 
-See [DATA_SCHEMA.md](DATA_SCHEMA.md) for the indexed representation. Source type, authority, temporal status, deprecation markers, and content hashes are stored with every vector so retrieval relevance does not become policy truth.
+See the [submission data schema PDF](output/pdf/learnforge-data-schema.pdf) for the indexed representation. Source type, authority, temporal status, deprecation markers, and content hashes are stored with every vector so retrieval relevance does not become policy truth. The editable technical reference remains in [DATA_SCHEMA.md](DATA_SCHEMA.md).
 
 ## Trade-offs
 
