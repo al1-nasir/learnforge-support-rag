@@ -62,7 +62,21 @@ Live evaluation traces add `eval_dataset`, `eval_case_id`, `eval_category`, expe
 
 The frontend uses assistant-ui’s `LocalRuntime` and calls the existing FastAPI endpoint directly; it does not require Assistant Cloud.
 
+### Welcome state
+
+![LearnForge Support Assistant welcome screen](screenshots/demo-welcome.png)
+
+### Grounded answer with citations
+
 ![Grounded response in the demo UI](screenshots/demo-grounded-answer.png)
+
+### Multi-turn support conversation
+
+![Multi-turn support conversation](screenshots/demo-multiturn.png)
+
+### Safe escalation state
+
+![Safe escalation state](screenshots/demo-escalation-state.png)
 
 Start it after the API is running:
 
