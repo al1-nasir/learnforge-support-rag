@@ -129,4 +129,4 @@ See the [submission data schema PDF](output/pdf/learnforge-data-schema.pdf) for 
 
 ## Limitations and next steps
 
-This is a take-home prototype, not a deployed support system. A production version would add durable sessions, managed vector storage, access controls, incremental content updates, and a larger evaluation set. A short demo video can be linked next to the Architecture and Evaluation links above when it is available.
+This is a take-home prototype, not a deployed support system. A production version would add durable sessions, managed vector storage, access controls, incremental content updates, and a larger evaluation set. 
